@@ -4,6 +4,7 @@ import { readDatabaseUri } from './config.js';
 import { connectDatabase, Note, Post, User } from './models.js';
 import { email, password } from './input.js';
 import { hashPassword } from './security.js';
+import { syncInterestMemberships } from './interest-memberships.js';
 
 function fixtureId(userId: Types.ObjectId, type: string, number: number) {
   const hex = createHash('sha256').update(type + ':' + userId + ':' + number).digest('hex');
@@ -14,14 +15,18 @@ type SeedUser = { name: string; email: string; password: string; role: 'user' | 
 
 async function ensureUser(input: SeedUser) {
   const { password, ...fields } = input;
-  const user = await User.findOneAndUpdate({ email: input.email }, {
-    $setOnInsert: { ...fields, passwordHash: await hashPassword(password), active: true, tokenVersion: 0,
-      createdAt: new Date(), updatedAt: new Date() }
-  }, { upsert: true, returnDocument: 'after', timestamps: false, setDefaultsOnInsert: false });
-  if (!user || user.role !== input.role || !user.active) {
-    throw new Error('Seed email already belongs to a conflicting or inactive account');
-  }
-  return user;
+  const passwordHash = await hashPassword(password);
+  return mongoose.connection.transaction(async session => {
+    const user = await User.findOneAndUpdate({ email: input.email }, {
+      $setOnInsert: { ...fields, passwordHash, active: true, tokenVersion: 0,
+        createdAt: new Date(), updatedAt: new Date() }
+    }, { upsert: true, returnDocument: 'after', timestamps: false, setDefaultsOnInsert: false, session });
+    if (!user || user.role !== input.role || !user.active) {
+      throw new Error('Seed email already belongs to a conflicting or inactive account');
+    }
+    await syncInterestMemberships(user, session);
+    return user;
+  });
 }
 
 try {

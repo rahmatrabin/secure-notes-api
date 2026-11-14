@@ -8,6 +8,10 @@ export function readDatabaseUri() {
 export function readConfig() {
   return {
     mongoUri: readDatabaseUri(),
+    mongoMaxPoolSize: z.coerce.number().int().min(1).max(200)
+      .parse(process.env.MONGO_MAX_POOL_SIZE ?? 10),
+    manageIndexes: z.enum(['0', '1']).parse(process.env.MONGO_MANAGE_INDEXES ?? '1') === '1',
+    redisUrl: z.string().regex(/^rediss?:\/\//).optional().parse(process.env.REDIS_URL || undefined),
     secret: z.string().min(43, 'Set JWT_SECRET to a randomly generated secret').parse(process.env.JWT_SECRET),
     frontendOrigin: z.url().refine(value => /^https?:\/\//.test(value) && new URL(value).origin === value)
       .parse(process.env.FRONTEND_ORIGIN ?? 'http://localhost:5173'),

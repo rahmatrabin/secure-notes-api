@@ -1,7 +1,8 @@
 import 'dotenv/config';
 import { randomBytes } from 'node:crypto';
 import mongoose, { Types } from 'mongoose';
-import { connectDatabase, Note, Post, User } from './models.js';
+import { connectDatabase, InterestMembership, Note, Post, User } from './models.js';
+import { membershipRows } from './interest-memberships.js';
 import { interestsPipeline, postsPipeline } from './queries.js';
 
 type Plan = {
@@ -44,6 +45,7 @@ try {
     interests: [n % 2 ? 'chess' : 'reading'], active: true
   }));
   await User.collection.insertMany(users);
+  await InterestMembership.insertMany(users.flatMap(membershipRows));
   const ids = users.flatMap(user => Array.from({ length: 12 }, () => user._id));
   await Note.collection.insertMany(ids.map(ownerId => ({ ownerId, title: 'Explain fixture', body: '' })));
   await Post.collection.insertMany(ids.map(authorId => ({ authorId, title: 'Explain fixture', body: 'Public' })));
@@ -61,7 +63,10 @@ try {
       .sort({ _id: -1 }).limit(6).explain('executionStats'),
     adminNotesPage: await Note.find({ _id: { $lt: cursor } }).sort({ _id: -1 }).limit(6).explain('executionStats'),
     publicPostsPage: await User.aggregate(postsPipeline(account._id, 5, postCursor)).explain('executionStats'),
-    interestGroups: await User.aggregate(interestsPipeline(5)).explain('executionStats')
+    interestGroups: await InterestMembership.aggregate(interestsPipeline(5)).explain('executionStats'),
+    interestGroupsDeep: await InterestMembership.aggregate(
+      interestsPipeline(5, { interest: 'chess', userId: users[351]._id })
+    ).explain('executionStats')
   };
   console.log(JSON.stringify(Object.fromEntries(Object.entries(reports).map(([name, report]) =>
     [name, summarize(report)]

@@ -22,6 +22,17 @@ const postSchema = new Schema({
   body: { type: String, required: true }
 }, { timestamps: true, collection: 'posts' });
 
+const interestMembershipSchema = new Schema({
+  userId: { type: Schema.Types.ObjectId, required: true },
+  interest: { type: String, required: true },
+  name: { type: String, required: true }
+}, { collection: 'interest_memberships', versionKey: false });
+
+interestMembershipSchema.index(
+  { interest: 1, userId: 1 }, { unique: true, name: 'interest_user_cursor' }
+);
+interestMembershipSchema.index({ userId: 1 }, { name: 'interest_user_sync' });
+
 userSchema.index({ email: 1 }, { unique: true, name: 'email_unique' });
 noteSchema.index({ ownerId: 1, _id: -1 }, { name: 'notes_owner_cursor' });
 postSchema.index({ authorId: 1, _id: -1 }, { name: 'posts_author_cursor' });
@@ -30,8 +41,21 @@ export const User = mongoose.model('User', userSchema);
 export const Note = mongoose.model('Note', noteSchema);
 export const Post = mongoose.model('Post', postSchema);
 
-export async function connectDatabase(uri: string) {
-  await mongoose.connect(uri, { serverSelectionTimeoutMS: 8000, maxPoolSize: 10 });
-  // Startup waits for the declared indexes, including the unique login constraint.
-  await Promise.all([User.init(), Note.init(), Post.init()]);
+export const InterestMembership = mongoose.model('InterestMembership', interestMembershipSchema);
+
+export async function connectDatabase(uri: string, options: {
+  manageIndexes?: boolean;
+  maxPoolSize?: number;
+} = {}) {
+  const { manageIndexes = true, maxPoolSize = 10 } = options;
+  await mongoose.connect(uri, {
+    autoIndex: manageIndexes,
+    autoCreate: manageIndexes,
+    serverSelectionTimeoutMS: 8000,
+    waitQueueTimeoutMS: 2000,
+    maxPoolSize
+  });
+  if (manageIndexes) {
+    await Promise.all([User.init(), Note.init(), Post.init(), InterestMembership.init()]);
+  }
 }

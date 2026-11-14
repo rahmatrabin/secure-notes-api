@@ -6,8 +6,9 @@ import 'dotenv/config';
 import jwt from 'jsonwebtoken';
 import mongoose, { Types } from 'mongoose';
 import { createApp } from '../dist/app.js';
-import { connectDatabase, Note, Post, User } from '../dist/models.js';
+import { connectDatabase, InterestMembership, Note, Post, User } from '../dist/models.js';
 import { hashPassword } from '../dist/security.js';
+import { syncInterestMemberships } from '../dist/interest-memberships.js';
 
 const uri = process.env.MONGODB_TEST_URI ?? 'mongodb://127.0.0.1:27017';
 const dbName = 'secure_notes_test_' + randomBytes(6).toString('hex');
@@ -60,6 +61,9 @@ before(async () => {
     { name: 'Asha', email: 'asha@example.test', interests: ['reading', 'chess'], passwordHash },
     { name: 'Rafi', email: 'rafi@example.test', interests: ['chess'], passwordHash }
   ]);
+  await mongoose.connection.transaction(async session => {
+    for (const user of [asha, rafi]) await syncInterestMemberships(user, session);
+  });
   server = createApp({ secret, frontendOrigin: origin }).listen(0, '127.0.0.1');
   await once(server, 'listening');
   baseUrl = 'http://127.0.0.1:' + server.address().port;
@@ -194,6 +198,17 @@ test('admin users CRUD, duplicate email under concurrency, role escalation and s
   const accountPath = path + '/' + account._id;
   const renamed = await request(accountPath, { token: adminToken, method: 'PATCH', body: { name: 'New name' } });
   assert.deepEqual(renamed.data.interests, ['chess']);
+  const groupMembers = async () => (await walk('/admin/interest-groups', adminToken, 1))
+    .flatMap(group => group.users.map(user => ({ interest: group.interest, ...user })))
+    .filter(user => user._id === account._id);
+  assert.deepEqual(await groupMembers(), [
+    { interest: 'chess', _id: account._id, name: 'New name' }
+  ]);
+  const moved = await request(accountPath, {
+    token: adminToken, method: 'PATCH', body: { interests: ['running', 'reading'] }
+  });
+  assert.equal(moved.status, 200);
+  assert.deepEqual((await groupMembers()).map(user => user.interest), ['reading', 'running']);
   const old = await login(body.email);
   const newPassword = 'Changed-only2!' + 'b'.repeat(46);
   const changed = await request(accountPath, { token: adminToken, method: 'PATCH', body: { password: newPassword } });
@@ -203,16 +218,20 @@ test('admin users CRUD, duplicate email under concurrency, role escalation and s
   const created = await request('/notes', { token: latest, method: 'POST', body: { title: 'Retained' } });
   assert.equal((await request(path + '/' + admin._id, { token: adminToken, method: 'DELETE' })).status, 404);
   assert.equal((await request(accountPath, { token: adminToken, method: 'DELETE' })).status, 204);
+  assert.deepEqual(await groupMembers(), []);
   assert.equal((await request('/me', { token: latest })).status, 401);
   assert.equal((await request('/users/' + account._id + '/posts')).status, 404);
   assert.equal((await walk(path, adminToken)).length, 3);
   assert.ok(await Note.exists({ _id: created.data._id }));
 });
 
-test('exactly three custom indexes exist across the three collections', async () => {
-  const indexes = await Promise.all([User, Note, Post].map(model => model.collection.indexes()));
-  assert.deepEqual(indexes.map(list => list.map(index => index.name)), [
-    ['_id_', 'email_unique'], ['_id_', 'notes_owner_cursor'], ['_id_', 'posts_author_cursor']
+test('only the declared query and membership sync indexes exist', async () => {
+  const indexes = await Promise.all([User, Note, Post, InterestMembership]
+    .map(model => model.collection.indexes()));
+  assert.deepEqual(indexes.map(list => list.map(index => index.name).sort()), [
+    ['_id_', 'email_unique'], ['_id_', 'notes_owner_cursor'], ['_id_', 'posts_author_cursor'],
+    ['_id_', 'interest_user_cursor', 'interest_user_sync']
   ]);
-  assert.equal(indexes[0][1].unique, true);
+  assert.equal(indexes[0].find(index => index.name === 'email_unique').unique, true);
+  assert.equal(indexes[3].find(index => index.name === 'interest_user_cursor').unique, true);
 });

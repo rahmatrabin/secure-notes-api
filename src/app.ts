@@ -1,18 +1,24 @@
 import express, { type ErrorRequestHandler } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import { rateLimit } from 'express-rate-limit';
+import { rateLimit, type Store } from 'express-rate-limit';
 import mongoose, { Types } from 'mongoose';
 import { z, ZodError } from 'zod';
 import {
   ApiError, createUser, loginInput, noteInput, objectId, page, pageQuery, pageSize,
   postInput, updateNote, updateUser
 } from './input.js';
-import { Note, Post, User } from './models.js';
+import { InterestMembership, Note, Post, User } from './models.js';
+import { syncInterestMemberships } from './interest-memberships.js';
 import { interestsPipeline, postsPipeline } from './queries.js';
 import { authenticate, hashPassword, issueToken, requireAdmin, verifyPassword, type Principal } from './security.js';
 
-type AppConfig = { secret: string; frontendOrigin: string; trustProxy?: number };
+type AppConfig = {
+  secret: string;
+  frontendOrigin: string;
+  trustProxy?: number;
+  loginStore?: Store;
+};
 type PublicUser = {
   _id: Types.ObjectId; name: string; email: string; role: string; active: boolean; interests: string[];
 };
@@ -53,6 +59,11 @@ const handleError: ErrorRequestHandler = (error, _req, res, next) => {
       issues: error.issues.map(issue => ({ field: issue.path.join('.'), message: issue.message }))
     });
   }
+  if (error?.code === 50 || error?.name === 'MongoWaitQueueTimeoutError' ||
+    error?.name === 'MongoServerSelectionError' || error?.name === 'MongoNotConnectedError') {
+    res.set('Retry-After', '1');
+    return res.status(503).json({ message: 'The service is busy. Try again shortly.' });
+  }
   if (error?.code === 11000) return res.status(409).json({ message: 'Email is already in use' });
   if (error?.type === 'entity.too.large') return res.status(413).json({ message: 'Request is too large' });
   if (error?.type === 'entity.parse.failed') return res.status(400).json({ message: 'Invalid JSON' });
@@ -76,6 +87,8 @@ export function createApp(config: AppConfig) {
   const auth = authenticate(config.secret);
   const principal = (res: express.Response) => res.locals.principal as Principal;
   const loginLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 25, skipSuccessfulRequests: true,
+    store: config.loginStore,
+    requestWasSuccessful: (_req, res) => res.statusCode < 400 || res.statusCode >= 500,
     standardHeaders: 'draft-8', legacyHeaders: false,
     message: { message: 'Too many login attempts. Try again later.' } });
 
@@ -84,12 +97,24 @@ export function createApp(config: AppConfig) {
     res.status(ready ? 200 : 503).json({ status: ready ? 'ok' : 'unavailable' });
   });
 
+  // Bound memory and worker-thread pressure from simultaneous Argon2 checks per API process.
+  let activeLogins = 0;
   app.post('/auth/login', loginLimiter, async (req, res) => {
     const input = loginInput.parse(req.body);
-    const user = await User.findOne({ email: input.email }).select(userFields + ' +passwordHash +tokenVersion').lean();
-    const valid = await verifyPassword(user?.passwordHash, input.password);
-    if (!user?.active || !valid) throw new ApiError(401, 'Invalid email or password');
-    res.json({ token: issueToken(user._id, user.tokenVersion, config.secret), user: exposeUser(user) });
+    if (activeLogins >= 4) {
+      res.set('Retry-After', '1');
+      throw new ApiError(503, 'Login is busy. Try again shortly.');
+    }
+    activeLogins++;
+    try {
+      const user = await User.findOne({ email: input.email })
+        .select(userFields + ' +passwordHash +tokenVersion').lean();
+      const valid = await verifyPassword(user?.passwordHash, input.password);
+      if (!user?.active || !valid) throw new ApiError(401, 'Invalid email or password');
+      res.json({ token: issueToken(user._id, user.tokenVersion, config.secret), user: exposeUser(user) });
+    } finally {
+      activeLogins--;
+    }
   });
 
   app.get('/me', auth, async (_req, res) => {
@@ -148,7 +173,13 @@ export function createApp(config: AppConfig) {
   });
   admin.post('/users', async (req, res) => {
     const { password, ...input } = createUser.parse(req.body);
-    const user = await User.create({ ...input, passwordHash: await hashPassword(password) });
+    const passwordHash = await hashPassword(password);
+    const user = await mongoose.connection.transaction(async session => {
+      const account = new User({ ...input, passwordHash });
+      await account.save({ session });
+      await syncInterestMemberships(account, session);
+      return account;
+    });
     res.status(201).json(exposeUser(user));
   });
   admin.patch('/users/:id', async (req, res) => {
@@ -158,24 +189,36 @@ export function createApp(config: AppConfig) {
       $set: { ...fields, passwordHash: await hashPassword(password) },
       $inc: { tokenVersion: 1 }
     };
-    const user = await User.findOneAndUpdate({ _id: id, active: true, role: 'user' }, update, {
-      returnDocument: 'after', runValidators: true
-    }).select(userFields).lean();
-    if (!user) throw new ApiError(404, 'Regular user not found');
+    const user = await mongoose.connection.transaction(async session => {
+      const account = await User.findOneAndUpdate({ _id: id, active: true, role: 'user' }, update, {
+        returnDocument: 'after', runValidators: true, session
+      }).select(userFields).lean();
+      if (!account) throw new ApiError(404, 'Regular user not found');
+      if (fields.name !== undefined || fields.interests !== undefined) {
+        await syncInterestMemberships(account, session);
+      }
+      return account;
+    });
     res.json(exposeUser(user));
   });
   admin.delete('/users/:id', async (req, res) => {
     const id = objectId.parse(req.params.id);
-    const result = await User.updateOne({ _id: id, active: true, role: 'user' }, {
-      $set: { active: false }, $inc: { tokenVersion: 1 }
+    await mongoose.connection.transaction(async session => {
+      const result = await User.updateOne({ _id: id, active: true, role: 'user' }, {
+        $set: { active: false }, $inc: { tokenVersion: 1 }
+      }, { session });
+      if (!result.modifiedCount) throw new ApiError(404, 'Regular user not found');
+      await InterestMembership.deleteMany({ userId: id }, { session });
     });
-    if (!result.modifiedCount) throw new ApiError(404, 'Regular user not found');
     res.sendStatus(204);
   });
 
   admin.get('/interest-groups', async (req, res) => {
     const { limit, cursor } = interestQuery.parse(req.query);
-    const groups = await User.collection.aggregate<Group>(interestsPipeline(limit, readInterestCursor(cursor))).toArray();
+    const groups = await InterestMembership.collection.aggregate<Group>(
+      interestsPipeline(limit, readInterestCursor(cursor)),
+      { maxTimeMS: 3000 }
+    ).toArray();
     const count = groups.reduce((sum, group) => sum + group.users.length, 0);
     let nextCursor: string | null = null;
     if (count > limit) {

@@ -3,23 +3,24 @@ import type { PipelineStage, Types } from 'mongoose';
 type InterestPosition = { interest: string; userId: Types.ObjectId };
 
 export function interestsPipeline(limit: number, cursor?: InterestPosition): PipelineStage[] {
-  const pipeline: PipelineStage[] = [
-    { $match: { active: true } },
-    { $project: { name: 1, interests: 1 } },
-    { $unwind: '$interests' }
-  ];
-  if (cursor) {
-    pipeline.push({ $match: { $or: [
-      { interests: { $gt: cursor.interest } },
-      { interests: cursor.interest, _id: { $gt: cursor.userId } }
-    ] } });
-  }
-  // Page memberships before grouping, keeping the number of returned members bounded.
+  const pageSize = limit + 1;
+  const sort: PipelineStage.Sort = { $sort: { interest: 1, userId: 1 } };
+  const take: PipelineStage.Limit = { $limit: pageSize };
+  const page: PipelineStage[] = cursor ? [
+    { $match: { interest: cursor.interest, userId: { $gt: cursor.userId } } },
+    sort,
+    take,
+    { $unionWith: {
+      coll: 'interest_memberships',
+      pipeline: [{ $match: { interest: { $gt: cursor.interest } } }, sort, take]
+    } },
+    sort,
+    take
+  ] : [sort, take];
+
   return [
-    ...pipeline,
-    { $sort: { interests: 1, _id: 1 } },
-    { $limit: limit + 1 },
-    { $group: { _id: '$interests', users: { $push: { _id: '$_id', name: '$name' } } } },
+    ...page,
+    { $group: { _id: '$interest', users: { $push: { _id: '$userId', name: '$name' } } } },
     { $sort: { _id: 1 } }
   ];
 }
