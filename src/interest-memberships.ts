@@ -15,8 +15,26 @@ export function membershipRows(user: InterestUser) {
   }));
 }
 
-export async function syncInterestMemberships(user: InterestUser, session: ClientSession) {
-  await InterestMembership.deleteMany({ userId: user._id }, { session });
+export async function syncInterestMemberships(
+  user: InterestUser,
+  session: ClientSession,
+  previousInterests: string[] = []
+) {
   const rows = membershipRows(user);
-  if (rows.length) await InterestMembership.insertMany(rows, { session });
+  const current = new Set(rows.map(row => row.interest));
+  const removed = [...new Set(previousInterests)].filter(interest => !current.has(interest));
+  if (!removed.length && !rows.length) return;
+
+  await InterestMembership.bulkWrite([
+    ...removed.map(interest => ({
+      deleteOne: { filter: { interest, userId: user._id } }
+    })),
+    ...rows.map(({ interest, userId, name }) => ({
+      updateOne: {
+        filter: { interest, userId },
+        update: { $set: { name }, $setOnInsert: { interest, userId } },
+        upsert: true
+      }
+    }))
+  ], { session });
 }

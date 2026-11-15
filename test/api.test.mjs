@@ -230,7 +230,7 @@ test('only the declared query and membership sync indexes exist', async () => {
     .map(model => model.collection.indexes()));
   assert.deepEqual(indexes.map(list => list.map(index => index.name).sort()), [
     ['_id_', 'email_unique'], ['_id_', 'notes_owner_cursor'], ['_id_', 'posts_author_cursor'],
-    ['_id_', 'interest_user_cursor', 'interest_user_sync']
+    ['_id_', 'interest_user_cursor']
   ]);
   assert.equal(indexes[0].find(index => index.name === 'email_unique').unique, true);
   assert.equal(indexes[3].find(index => index.name === 'interest_user_cursor').unique, true);

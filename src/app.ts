@@ -190,12 +190,15 @@ export function createApp(config: AppConfig) {
       $inc: { tokenVersion: 1 }
     };
     const user = await mongoose.connection.transaction(async session => {
-      const account = await User.findOneAndUpdate({ _id: id, active: true, role: 'user' }, update, {
+      const filter = { _id: id, active: true, role: 'user' as const };
+      const previous = fields.interests === undefined ? null :
+        await User.findOne(filter).select('interests').session(session).lean();
+      const account = await User.findOneAndUpdate(filter, update, {
         returnDocument: 'after', runValidators: true, session
       }).select(userFields).lean();
       if (!account) throw new ApiError(404, 'Regular user not found');
       if (fields.name !== undefined || fields.interests !== undefined) {
-        await syncInterestMemberships(account, session);
+        await syncInterestMemberships(account, session, previous?.interests);
       }
       return account;
     });
@@ -204,11 +207,11 @@ export function createApp(config: AppConfig) {
   admin.delete('/users/:id', async (req, res) => {
     const id = objectId.parse(req.params.id);
     await mongoose.connection.transaction(async session => {
-      const result = await User.updateOne({ _id: id, active: true, role: 'user' }, {
+      const previous = await User.findOneAndUpdate({ _id: id, active: true, role: 'user' }, {
         $set: { active: false }, $inc: { tokenVersion: 1 }
-      }, { session });
-      if (!result.modifiedCount) throw new ApiError(404, 'Regular user not found');
-      await InterestMembership.deleteMany({ userId: id }, { session });
+      }, { session, returnDocument: 'before' }).select('name interests').lean();
+      if (!previous) throw new ApiError(404, 'Regular user not found');
+      await syncInterestMemberships({ ...previous, active: false }, session, previous.interests);
     });
     res.sendStatus(204);
   });

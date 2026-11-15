@@ -31,7 +31,6 @@ const interestMembershipSchema = new Schema({
 interestMembershipSchema.index(
   { interest: 1, userId: 1 }, { unique: true, name: 'interest_user_cursor' }
 );
-interestMembershipSchema.index({ userId: 1 }, { name: 'interest_user_sync' });
 
 userSchema.index({ email: 1 }, { unique: true, name: 'email_unique' });
 noteSchema.index({ ownerId: 1, _id: -1 }, { name: 'notes_owner_cursor' });
